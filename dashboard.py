@@ -28,12 +28,6 @@ try:
 except ImportError:
     HAS_AUTOREFRESH = False
 
-# Session state for history (Bug 3 fix)
-if "prediction_history" not in st.session_state:
-    st.session_state.prediction_history = []
-if "history_loaded" not in st.session_state:
-    st.session_state.history_loaded = False
-
 # ---------- config ----------
 st.set_page_config(
     page_title="BTC Forecaster",
@@ -50,7 +44,6 @@ N_BARS        = 500    # bars fed into model
 CHART_BARS    = 50     # bars shown on chart
 VOL_WINDOW    = 20     # short window for vol clustering
 FIT_WINDOW    = 100    # longer window for Student-t fit
-LOOKBACK      = 100    # lookback for model (Bug 5 fix)
 N_SIM         = 10000  # MC simulations
 ALPHA         = 0.05   # 95% CI → alpha = 0.05
 
@@ -82,24 +75,19 @@ def get_btc_data(n=N_BARS):
         df[c] = df[c].astype(float)
     df = df.sort_values("ts").reset_index(drop=True)
 
-    # Bug 8 fix: warn if insufficient data
     if len(df) < n * 0.85:
-        st.warning(f"⚠️ Only got {len(df)} bars (wanted {n}). Binance may be throttling or experiencing issues.")
-    if len(df) < 100:
-        st.error(f"🔴 Insufficient data ({len(df)} bars). Model requires at least 100 bars.")
+        st.warning(f"Only got {len(df)} bars (wanted {n}). Binance may be throttling.")
     return df
 
 
 # ---------- model ----------
-def predict(closes, lookback=LOOKBACK):
+def predict(closes):
     """
     GBM + Student-t one-step-ahead 95% interval.
     Key ideas:
       - vol from last VOL_WINDOW bars only (captures clustering)
       - Student-t fit for fat tails (BTC blows up more than Gaussian expects)
       - simulate N_SIM paths, read off 2.5 / 97.5 percentiles
-    
-    Bug 5 fix: now accepts lookback parameter for consistency with backtest
     """
     log_ret = np.diff(np.log(closes))
 
@@ -107,7 +95,7 @@ def predict(closes, lookback=LOOKBACK):
     recent_vol = np.std(log_ret[-VOL_WINDOW:], ddof=1)
 
     # fit Student-t on longer history to get degrees-of-freedom (nu)
-    fit_data = log_ret[-min(lookback, len(log_ret)):]
+    fit_data = log_ret[-min(FIT_WINDOW, len(log_ret)):]
     nu, mu, _ = student_t.fit(fit_data, floc=0)
 
     S0 = closes[-1]
@@ -134,7 +122,6 @@ def winkler(low, high, actual):
 
 # ---------- vol regime ----------
 def regime(vol_ann):
-    """Volatility regime indicator for dashboard."""
     if vol_ann < 40:
         return "🟢 Calm", "green"
     elif vol_ann < 80:
@@ -143,89 +130,64 @@ def regime(vol_ann):
         return "🔴 Volatile", "red"
 
 
-def coverage_health(cov):
-    """Coverage health indicator (green/yellow/red)."""
-    diff = abs(cov - 0.95)
-    if diff <= 0.02:
-        return "🟢 Healthy", "green"
-    elif diff <= 0.05:
-        return "🟡 Acceptable", "orange"
-    else:
-        return "🔴 Poor", "red"
-
-
 # ---------- history helpers (Part C) ----------
 def load_history():
-    """Bug 3 fix: Load from session state (persistent across reruns), sync with file on first load."""
-    if not st.session_state.history_loaded:
-        # First load: read from file if exists
-        if Path(HIST_FILE).exists():
-            with open(HIST_FILE) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        try:
-                            st.session_state.prediction_history.append(json.loads(line))
-                        except Exception:
-                            pass
-        st.session_state.history_loaded = True
-    return st.session_state.prediction_history
+    if not Path(HIST_FILE).exists():
+        return []
+    out = []
+    with open(HIST_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    pass
+    return out
 
 
 def bar_key(ts_str):
-    """Bug 1 fix: Normalize any ISO timestamp to YYYY-MM-DDTHH for dedup / matching."""
+    """Normalize any ISO timestamp to YYYY-MM-DDTHH for dedup / matching."""
     try:
-        dt = pd.to_datetime(ts_str, utc=True)
-        return dt.strftime("%Y-%m-%dT%H")
+        return pd.to_datetime(ts_str, utc=True).strftime("%Y-%m-%dT%H")
     except Exception:
-        # Fallback for malformed timestamps
         return str(ts_str)[:13]
 
 
-def save_prediction(record):
-    """Bug 2 fix: Only add if we don't already have a prediction for this target bar (in session state)."""
+def save_prediction(record, history):
+    """Only write if we don't already have a prediction for this target bar."""
     key = bar_key(record["target_ts"])
-    history = st.session_state.prediction_history
-    
-    # Check if already exists
     if any(bar_key(r.get("target_ts", "")) == key for r in history):
         return  # already saved one for this hour
-    
-    # Add to session state
-    history.append(record)
-    
-    # Also append to file for persistence
     with open(HIST_FILE, "a") as f:
         f.write(json.dumps(record) + "\n")
 
 
-def fill_actuals(df):
-    """Bug 1 & 3 fix: Back-fill real prices once bars close. Works with session state."""
-    history = st.session_state.prediction_history
+def fill_actuals(history, df):
+    """Back-fill real prices once bars close."""
     if not history:
-        return
-    
-    # Bug 1 fix: map normalized hour → close price using consistent format
-    price_map = {}
-    for row in df.itertuples():
-        key = row.ts.strftime("%Y-%m-%dT%H")
-        price_map[key] = float(row.close)
-    
-    changed = False
+        return history
+
+    # map normalised hour → close price
+    price_map = {row.ts.strftime("%Y-%m-%dT%H"): float(row.close) for row in df.itertuples()}
+
+    updated, changed = [], False
     for rec in history:
         if rec.get("actual") is None:
             k = bar_key(rec.get("target_ts", ""))
             if k in price_map:
+                rec = dict(rec)
                 rec["actual"]  = price_map[k]
                 rec["hit"]     = rec["low95"] <= rec["actual"] <= rec["high95"]
                 rec["winkler"] = winkler(rec["low95"], rec["high95"], rec["actual"])
                 changed = True
-    
-    # Bug 3 fix: rewrite file only if changed (but session state is source of truth)
+        updated.append(rec)
+
     if changed:
         with open(HIST_FILE, "w") as f:
-            for r in history:
+            for r in updated:
                 f.write(json.dumps(r) + "\n")
+    return updated
 
 
 # ---------- load backtest results (Part A) ----------
@@ -366,33 +328,26 @@ def history_chart(history):
 
 # ==================== MAIN ====================
 
-# Bug 6 fix: Use st_autorefresh instead of blocking sleep
-if HAS_AUTOREFRESH:
-    # Auto-refresh every 60 seconds
-    st_autorefresh(interval=60_000, key="refresh")
-
 # sidebar
 with st.sidebar:
     st.markdown("### ⚙️ Settings")
-    if HAS_AUTOREFRESH:
-        st.success("✅ Auto-refresh enabled (60s)")
-    else:
-        st.warning("⚠️ Install streamlit-autorefresh for auto-refresh")
-        st.code("pip install streamlit-autorefresh", language="bash")
-    
-    if st.button("🔄 Refresh now"):
+    do_refresh = st.checkbox("Auto-refresh (60s)", value=False)
+    if st.button("Refresh now"):
         st.cache_data.clear()
         st.rerun()
-    
     st.markdown("---")
     st.markdown("**Model**")
     st.write(f"- Confidence: 95%")
     st.write(f"- Vol window: {VOL_WINDOW} bars")
-    st.write(f"- Lookback: {LOOKBACK} bars")
     st.write(f"- Simulations: {N_SIM:,}")
     st.write(f"- History: {N_BARS} bars")
     st.markdown("---")
     st.caption("AlphaI × Polaris · GBM + Student-t\nData: data-api.binance.vision")
+
+if do_refresh and HAS_AUTOREFRESH:
+    st_autorefresh(interval=60_000, key="refresh")
+elif do_refresh:
+    st.sidebar.info("pip install streamlit-autorefresh for non-blocking refresh")
 
 # header
 st.title("₿  BTC/USDT — Next-Hour 95% Forecaster")
@@ -413,9 +368,9 @@ if err:
     st.stop()
 
 next_bar = df["ts"].iloc[-1] + pd.Timedelta(hours=1)
-secs_left_total = max(0, (next_bar.to_pydatetime() - now).total_seconds())
-mins_left = int(secs_left_total // 60)
-secs_left = int(secs_left_total % 60)
+secs_left = max(0, (next_bar.to_pydatetime() - now).total_seconds())
+mins_left = int(secs_left // 60)
+secs_left = int(secs_left % 60)
 
 # ---------- Part A metrics ----------
 bt = load_backtest()
@@ -431,10 +386,7 @@ if bt:
     c.metric("Winkler ↓", f"${bt['winkler']:,.0f}",
              help="Combined accuracy+tightness score. Lower is better.")
     d.metric("Predictions", f"{bt['n']:,}")
-    
-    # Coverage health indicator
-    health_label, health_color = coverage_health(bt['coverage'])
-    st.caption(f"Coverage verdict: **{cov_badge(bt['coverage'])}** · Health: **{health_label}**")
+    st.caption(f"Coverage verdict: **{cov_badge(bt['coverage'])}**")
 else:
     st.info("No backtest_results.jsonl found. Run btc_gbm_backtest.py and push the file.")
 
@@ -478,11 +430,10 @@ record = {
     "winkler":         None,
 }
 
-# Bug 2 & 3 fix: Load from session state, save with deduplication
 history = load_history()
-save_prediction(record)
-fill_actuals(df)
-history = st.session_state.prediction_history
+save_prediction(record, history)
+history = load_history()
+history = fill_actuals(history, df)
 
 st.divider()
 
@@ -502,10 +453,7 @@ if resolved:
     h2.metric("Live Winkler ↓", f"${live_wink:,.0f}")
     h3.metric("Avg width",      f"${live_w:,.0f}")
     h4.metric("Resolved",       len(resolved))
-    
-    # Coverage health indicator
-    health_label, health_color = coverage_health(live_cov)
-    st.caption(f"Live verdict: **{cov_badge(live_cov)}** · Health: **{health_label}**")
+    st.caption(f"Live verdict: **{cov_badge(live_cov)}**")
 
     fig_h = history_chart(history)
     if fig_h:
@@ -516,15 +464,11 @@ else:
 with st.expander("Raw prediction log"):
     if history:
         dh = pd.DataFrame(history[::-1])
-        # Bug 4 fix: Keep actual column in display
         cols = [c for c in ["target_ts", "price", "low95", "high95", "width", "actual", "hit", "winkler"] if c in dh.columns]
         display = dh[cols].copy()
-        for col in ["price", "low95", "high95", "width", "winkler"]:
+        for col in ["price", "low95", "high95", "width", "actual", "winkler"]:
             if col in display.columns:
                 display[col] = display[col].apply(lambda x: f"${x:,.2f}" if pd.notna(x) and x is not None else "—")
-        # Bug 4 fix: Show actual values properly
-        if "actual" in display.columns:
-            display["actual"] = display["actual"].apply(lambda x: f"${x:,.2f}" if pd.notna(x) and x is not None else "⏳")
         display["hit"] = display["hit"].apply(lambda x: "✅" if x is True else ("❌" if x is False else "⏳"))
         st.dataframe(display, use_container_width=True, height=280)
     else:
